@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/unreallabsai/unreal-agent/harness/session"
+	"github.com/unreallabsai/unreal-agent/harness/sessionstore"
 
 	"github.com/awersli99/unreal-tui/internal/engine"
 	"github.com/awersli99/unreal-tui/internal/testutil"
@@ -146,4 +148,21 @@ func TestFormatTokens(t *testing.T) {
 			t.Errorf("formatTokens(%d) = %q, want %q", count, got, want)
 		}
 	}
+}
+
+// A blank line separates the live area from the scrollback, like the one
+// between printed blocks, whether the agent is idle or thinking.
+func TestLiveAreaStartsWithBlankLine(t *testing.T) {
+	current := newLoginTestModel(t)
+	current.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	check := func(state, want string) {
+		t.Helper()
+		lines := strings.Split(ansiEscape.ReplaceAllString(current.View(), ""), "\n")
+		if len(lines) < 2 || strings.TrimSpace(lines[0]) != "" || !strings.Contains(lines[1], want) {
+			t.Fatalf("%s: live area starts with %q", state, lines[:min(2, len(lines))])
+		}
+	}
+	check("idle", "─")
+	current.transcript.Apply(sessionstore.Item{Data: session.Turn{ID: "turn"}})
+	check("thinking", "Thinking…")
 }
