@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/glamour/ansi"
 	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/lipgloss"
+	xansi "github.com/charmbracelet/x/ansi"
 
 	"github.com/awersli99/unreal-tui/internal/engine"
 )
@@ -18,6 +19,8 @@ import (
 const (
 	toolPreviewHead = 8
 	toolPreviewTail = 4
+	// toolHeaderRows bounds a wrapped tool call title outside the transcript.
+	toolHeaderRows = 6
 	// markdownMargin is the left margin of glamour's dark and light styles,
 	// which assistant text is rendered with.
 	markdownMargin = 2
@@ -154,7 +157,7 @@ func (current *renderer) tool(view *engine.ToolView, full bool) string {
 	default:
 		marker = dimStyle.Render("○")
 	}
-	header := marker + " " + current.toolHeader(view)
+	header := current.toolHeader(view, marker, "", full)
 	output := strings.TrimRight(view.Output, "\n")
 	if output == "" {
 		return header
@@ -178,23 +181,34 @@ func (current *renderer) tool(view *engine.ToolView, full bool) string {
 	return header + body.String()
 }
 
-func (current *renderer) toolHeader(view *engine.ToolView) string {
-	title := view.Title
+// toolHeader renders a tool call's name and title after lead (its status
+// marker), followed by trail. A long title wraps, indented under its first
+// row, instead of running off the screen; unless full, it is cut short after
+// toolHeaderRows rows. Only the first line of a multi-line title is shown.
+func (current *renderer) toolHeader(view *engine.ToolView, lead, trail string, full bool) string {
+	title := strings.ReplaceAll(view.Title, "\t", "    ")
 	if view.Name == "Bash" {
 		title = "$ " + title
 	}
-	name := toolNameStyle.Render(view.Name)
-	available := max(10, current.width-lipgloss.Width(view.Name)-4)
 	line, rest, multiline := strings.Cut(title, "\n")
-	var suffix string
 	if multiline {
-		suffix = fmt.Sprintf(" (+%d lines)", strings.Count(rest, "\n")+1)
-		available -= len(suffix)
+		trail = dimStyle.Render(fmt.Sprintf(" (+%d lines)", strings.Count(rest, "\n")+1)) + trail
 	}
-	if lipgloss.Width(line) > available {
-		line = truncateWidth(line, max(1, available-1)) + "…"
+	prefix := toolNameStyle.Render(view.Name) + " "
+	if lead != "" {
+		prefix = lead + " " + prefix
 	}
-	return name + " " + line + dimStyle.Render(suffix)
+	indent := lipgloss.Width(prefix)
+	// The last column is left free; some terminals wrap or clip it.
+	available := max(10, current.width-indent-1)
+	rows := strings.Split(xansi.Wrap(line+trail, available, ""), "\n")
+	if !full && len(rows) > toolHeaderRows {
+		rows = rows[:toolHeaderRows]
+		last := strings.Split(xansi.Wrap(line, available, ""), "\n")[toolHeaderRows-1]
+		room := max(1, available-lipgloss.Width(trail)-1)
+		rows[len(rows)-1] = xansi.Truncate(last, room, "") + "…" + trail
+	}
+	return prefix + strings.Join(rows, "\n"+strings.Repeat(" ", indent))
 }
 
 func truncateWidth(text string, width int) string {

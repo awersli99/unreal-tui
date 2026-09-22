@@ -166,3 +166,32 @@ func TestLiveAreaStartsWithBlankLine(t *testing.T) {
 	current.transcript.Apply(sessionstore.Item{Data: session.Turn{ID: "turn"}})
 	check("thinking", "Thinking…")
 }
+
+// Long tool calls wrap under their title rather than running off the screen,
+// and the live line keeps its elapsed time.
+func TestToolHeaderWraps(t *testing.T) {
+	render := newRenderer("dark", 40)
+	view := &engine.ToolView{Name: "Bash", Title: strings.Repeat("echo word ", 12) + "\nsecond line"}
+	strip := func(text string) []string { return strings.Split(ansiEscape.ReplaceAllString(text, ""), "\n") }
+
+	lines := strip(render.toolHeader(view, "●", " 3s", false))
+	if len(lines) < 3 || !strings.HasPrefix(lines[0], "● Bash $ echo") || !strings.HasSuffix(lines[len(lines)-1], "(+1 lines) 3s") {
+		t.Fatalf("header lines %q", lines)
+	}
+	for _, line := range lines {
+		if len([]rune(line)) >= 40 {
+			t.Fatalf("line %q is wider than the terminal", line)
+		}
+		if line != lines[0] && !strings.HasPrefix(line, strings.Repeat(" ", 7)) {
+			t.Fatalf("continuation %q is not indented", line)
+		}
+	}
+
+	view.Title = strings.Repeat("x", 1000)
+	if lines = strip(render.toolHeader(view, "●", " 3s", false)); len(lines) != toolHeaderRows || !strings.HasSuffix(lines[len(lines)-1], "… 3s") {
+		t.Fatalf("long header lines %q", lines)
+	}
+	if lines = strip(render.toolHeader(view, "●", "", true)); len(lines) <= toolHeaderRows {
+		t.Fatalf("full header cut to %d lines", len(lines))
+	}
+}

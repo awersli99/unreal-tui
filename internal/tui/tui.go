@@ -583,7 +583,7 @@ func (current *model) View() string {
 		if !view.Started.IsZero() {
 			elapsed = dimStyle.Render(" " + formatElapsed(time.Since(view.Started)))
 		}
-		sections = append(sections, current.spinner.View()+" "+current.render.toolHeader(view)+elapsed)
+		sections = append(sections, current.render.toolHeader(view, current.spinner.View(), elapsed, false))
 	}
 	if current.busy() {
 		label := "Working"
