@@ -29,6 +29,8 @@ type overlay struct {
 	keys func(key string) (tea.Cmd, bool)
 	// stay keeps the picker open after enter.
 	stay bool
+	// view, when set, renders the selector in place of its default view.
+	view func(width int) string
 }
 
 var thinkingDescriptions = map[string]string{
@@ -50,6 +52,9 @@ var thinkingColors = map[string]lipgloss.AdaptiveColor{
 func (active *overlay) View(width int) string {
 	if active.prompt != nil {
 		return active.prompt.View(width)
+	}
+	if active.view != nil {
+		return active.view(width)
 	}
 	return active.selector.View(width)
 }
@@ -168,38 +173,6 @@ func (current *model) cycleThinking() tea.Cmd {
 	levels := current.app.Model.SupportedLevels()
 	position := slices.Index(levels, current.app.Thinking)
 	return current.setThinking(levels[(position+1)%len(levels)])
-}
-
-func (current *model) openModelPicker(query string) {
-	app := current.app
-	models := slices.Clone(app.Catalog.Models)
-	if !slices.ContainsFunc(models, func(model provider.ModelInfo) bool { return model.Key() == app.Model.Key() }) {
-		models = append([]provider.ModelInfo{app.Model}, models...)
-	}
-	items := make([]selectorItem, 0, len(models))
-	for _, info := range models {
-		items = append(items, modelItem(info, info.Key() == app.Model.Key()))
-	}
-	picker := newSelector("Select model", "type to filter · enter select · esc cancel", items, true)
-	picker.extra = func(query string) *selectorItem {
-		info, _, err := app.Catalog.Resolve(query, app.Model.Provider)
-		if err != nil {
-			return nil
-		}
-		item := modelItem(info, false)
-		item.Label = "use " + info.Key()
-		item.Detail = "model ID not in the catalog"
-		return &item
-	}
-	if query != "" {
-		picker.setQuery(query)
-	}
-	current.overlay = &overlay{
-		selector: picker,
-		choose: func(item *selectorItem) tea.Cmd {
-			return current.switchModel(item.Value.(provider.ModelInfo), "")
-		},
-	}
 }
 
 func modelItem(info provider.ModelInfo, isCurrent bool) selectorItem {

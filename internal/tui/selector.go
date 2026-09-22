@@ -189,6 +189,19 @@ func (current *selector) scrollToCursor() {
 	}
 }
 
+// window is the range of positions shown: at most selectorRows from offset.
+func (current *selector) window() (start, end int) {
+	return current.offset, min(current.count(), current.offset+selectorRows)
+}
+
+// itemAt returns the item at a position in the filtered list.
+func (current *selector) itemAt(position int) selectorItem {
+	if position < len(current.visible) {
+		return current.items[current.visible[position]]
+	}
+	return *current.extraItem
+}
+
 func (current *selector) View(width int) string {
 	titleStyle := lipgloss.NewStyle().Foreground(accentColor).Bold(true)
 	lines := []string{titleStyle.Render(current.title)}
@@ -199,15 +212,9 @@ func (current *selector) View(width int) string {
 	if count == 0 {
 		lines = append(lines, dimStyle.Render("  no matches"))
 	}
-	end := min(count, current.offset+selectorRows)
-	for position := current.offset; position < end; position++ {
-		var item selectorItem
-		if position < len(current.visible) {
-			item = current.items[current.visible[position]]
-		} else {
-			item = *current.extraItem
-		}
-		lines = append(lines, current.row(item, position == current.cursor, width))
+	start, end := current.window()
+	for position := start; position < end; position++ {
+		lines = append(lines, current.row(current.itemAt(position), position == current.cursor, width))
 	}
 	if count > selectorRows {
 		lines = append(lines, dimStyle.Render(fmt.Sprintf("  %d/%d", current.cursor+1, count)))
