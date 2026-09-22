@@ -164,6 +164,9 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case anthropicLoginFinishedMsg:
 		return current, current.handleAnthropicLoginFinished(message)
 
+	case clipboardImagePastedMsg:
+		return current, current.handleClipboardImage(message)
+
 	case EngineEventMsg:
 		current.branch = gitBranch(current.app.Config.Workspace)
 		return current, current.handleEngineEvent(message.Event)
@@ -275,6 +278,9 @@ func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 
 	case "ctrl+o":
 		return current.openPager(), true
+
+	case "ctrl+v":
+		return pasteClipboard(), true
 
 	case "ctrl+l":
 		current.openModelPicker("")

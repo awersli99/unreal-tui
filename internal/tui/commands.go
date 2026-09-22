@@ -16,7 +16,7 @@ const keysHelp = `Keys
   enter send · ctrl+j / alt+enter newline · ↑/↓ message history · / commands
   esc interrupt · ctrl+c clear input / interrupt · ctrl+o full transcript
   ctrl+l model picker · ctrl+p / alt+p next / previous model · shift+tab cycle thinking
-  ctrl+t toggle thinking blocks
+  ctrl+t toggle thinking blocks · ctrl+v paste an image or text
   In pickers: type to filter · ↑/↓ move · enter select · esc cancel
 
 Model and thinking changes are remembered as the defaults for the next start.

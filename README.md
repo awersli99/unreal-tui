@@ -49,6 +49,7 @@ Run `unreal --help` for every flag.
 | `ctrl+l` / `ctrl+p` | Model picker / next model |
 | `shift+tab` | Cycle thinking level |
 | `ctrl+o` | Full transcript |
+| `ctrl+v` | Paste an image (saved to a temp file, path inserted) or text |
 | `ctrl+c` twice / `ctrl+d` | Exit |
 
 Type `/` to see commands: `/model`, `/thinking`, `/login`, `/logout`, `/new`,
