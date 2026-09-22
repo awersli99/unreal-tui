@@ -19,9 +19,9 @@ reasonable amount of time to fix the issue before you disclose it publicly.
 ## Scope
 
 By design, unreal lets an LLM run shell commands on your machine with your
-permissions and no approval prompt (see [Security](README.md#security) in the
-README). That behaviour is not a vulnerability in itself. The following are in
-scope, for example:
+permissions and no approval prompt (see the warning in the
+[README](README.md)). That behaviour is not a vulnerability in itself. The
+following are in scope, for example:
 
 - credentials in `auth.json` being leaked, logged, sent to the wrong host, or
   written with insecure permissions
