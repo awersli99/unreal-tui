@@ -1,4 +1,4 @@
-module github.com/adam/unreal-tui
+module github.com/awersli99/unreal-tui
 
 go 1.27.1
 
