@@ -44,6 +44,14 @@ func newRenderer(style string, width int) *renderer {
 	return current
 }
 
+func (current *renderer) setStyle(style string) {
+	if style != current.style {
+		current.style = style
+		current.markdown = nil
+		current.resize(current.width)
+	}
+}
+
 func (current *renderer) resize(width int) {
 	if width <= 0 {
 		width = 80
@@ -165,14 +173,19 @@ func truncateWidth(text string, width int) string {
 	return builder.String()
 }
 
+// formatTokens abbreviates token counts the way pi's footer does.
 func formatTokens(count int64) string {
 	switch {
-	case count >= 1_000_000:
-		return fmt.Sprintf("%.1fM", float64(count)/1_000_000)
-	case count >= 1_000:
-		return fmt.Sprintf("%.1fk", float64(count)/1_000)
-	default:
+	case count < 1_000:
 		return fmt.Sprint(count)
+	case count < 10_000:
+		return fmt.Sprintf("%.1fk", float64(count)/1_000)
+	case count < 1_000_000:
+		return fmt.Sprintf("%dk", (count+500)/1_000)
+	case count < 10_000_000:
+		return fmt.Sprintf("%.1fM", float64(count)/1_000_000)
+	default:
+		return fmt.Sprintf("%dM", (count+500_000)/1_000_000)
 	}
 }
 

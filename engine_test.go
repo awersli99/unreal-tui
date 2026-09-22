@@ -316,6 +316,41 @@ func TestEffortChangeReachesModel(t *testing.T) {
 	}
 }
 
+// A model switch while a tool runs applies to the very next model call, with
+// no restart: the follow-up request goes to the new client with the new model
+// and prompt, and still carries the tool result.
+func TestModelSwitchMidTurn(t *testing.T) {
+	current := newHarness(t, newFakeClient(callBash("sleep 1; echo slept")))
+	if err := current.engine.Send("go"); err != nil {
+		t.Fatal(err)
+	}
+	current.waitForCall()
+	next := newFakeClient(replyWith("from next"))
+	current.engine.SetModel(next, "next-model")
+	current.engine.SetSystemPrompt("next prompt")
+	current.waitForAssistant("from next")
+
+	request := next.request(0)
+	if request.Model.ID != "next-model" {
+		t.Fatalf("model = %q, want next-model", request.Model.ID)
+	}
+	var sawPrompt, sawResult bool
+	for _, item := range request.Input {
+		switch data := item.Data.(type) {
+		case llm.Message:
+			sawPrompt = sawPrompt || strings.Contains(data.Text, "next prompt")
+		case llm.ToolResult:
+			sawResult = true
+		}
+	}
+	if !sawPrompt || !sawResult {
+		t.Fatalf("prompt updated %v, tool result carried %v; input %+v", sawPrompt, sawResult, request.Input)
+	}
+	if calls := len(current.client.requests); calls != 1 {
+		t.Fatalf("old client got %d calls, want 1", calls)
+	}
+}
+
 func equalKinds(left, right []BlockKind) bool {
 	if len(left) != len(right) {
 		return false

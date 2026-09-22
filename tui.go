@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -13,25 +15,13 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/unreallabsai/unreal-agent/harness/session"
+	"github.com/unreallabsai/unreal-agent/harness/llm"
 )
 
 const (
 	maxInputHeight  = 10
 	quitArmDuration = 2 * time.Second
 )
-
-// App holds what the TUI needs besides the engine: settings and paths.
-type App struct {
-	Engine    *Engine
-	Home      string
-	Workspace string
-	Settings  Settings
-	Style     string
-	Initial   string
-	Resume    session.ID
-	Notices   []Block
-}
 
 type engineEventMsg struct{ event any }
 
@@ -67,11 +57,18 @@ type model struct {
 	busySince time.Time
 	quitArmed time.Time
 	notice    string
+
+	// overlay, when set, is a picker shown in place of the editor.
+	overlay *overlay
+	// suggest is the slash-command autocomplete list under the editor.
+	suggest suggestState
+	// branch is the workspace's git branch, refreshed after each event.
+	branch string
 }
 
 func newModel(app *App) *model {
 	input := textarea.New()
-	input.Placeholder = "Message the agent… (/help for commands)"
+	input.Placeholder = "Message the agent… (/ for commands)"
 	input.ShowLineNumbers = false
 	input.CharLimit = 0
 	input.MaxHeight = 1000
@@ -93,10 +90,11 @@ func newModel(app *App) *model {
 		app:          app,
 		engine:       app.Engine,
 		transcript:   NewTranscript(app.Engine.ResultTranslator),
-		render:       newRenderer(app.Style, 80),
+		render:       newRenderer(app.Style(), 80),
 		input:        input,
 		spinner:      spin,
-		showThinking: true,
+		showThinking: !app.Config.Settings.HideThinkingBlock,
+		branch:       gitBranch(app.Config.Workspace),
 	}
 	return current
 }
@@ -106,15 +104,18 @@ func (current *model) Init() tea.Cmd {
 }
 
 // start runs once the terminal size is known, so the first output is
-// rendered at the right width: banner, then any resumed history, then the
-// prompt given on the command line.
+// rendered at the right width: loaded resources, then any resumed history,
+// then the prompt given on the command line.
 func (current *model) start() tea.Cmd {
-	commands := []tea.Cmd{current.printBanner()}
+	commands := []tea.Cmd{current.printStartup()}
 	if current.app.Resume != "" {
 		commands = append(commands, current.loadSession(current.app.Resume))
 	}
 	if current.app.Initial != "" {
 		commands = append(commands, current.submit(current.app.Initial))
+	}
+	if current.app.OpenResume {
+		commands = append(commands, current.openResumePicker())
 	}
 	return tea.Batch(commands...)
 }
@@ -144,6 +145,7 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		return current, current.flush()
 
 	case engineEventMsg:
+		current.branch = gitBranch(current.app.Config.Workspace)
 		return current, current.handleEngineEvent(message.event)
 
 	case spinner.TickMsg:
@@ -155,6 +157,9 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if current.pagerOpen {
 			return current, current.handlePagerKey(message)
 		}
+		if current.overlay != nil {
+			return current, current.handleOverlayKey(message)
+		}
 		if command, handled := current.handleKey(message); handled {
 			return current, command
 		}
@@ -163,12 +168,56 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	var command tea.Cmd
 	current.input, command = current.input.Update(message)
 	current.resizeInput()
+	current.syncSuggestions()
 	return current, command
+}
+
+// syncSuggestions recomputes the autocomplete list when the editor changes.
+func (current *model) syncSuggestions() {
+	value := current.input.Value()
+	if value == current.suggest.input {
+		return
+	}
+	current.suggest = suggestState{input: value, items: current.app.suggestionsFor(value)}
+}
+
+// handleSuggestKey drives the autocomplete list like pi's: ↑/↓ select, tab
+// completes, enter completes and submits, esc dismisses.
+func (current *model) handleSuggestKey(message tea.KeyMsg) (tea.Cmd, bool) {
+	switch message.String() {
+	case "up":
+		current.suggest.move(-1)
+	case "down":
+		current.suggest.move(1)
+	case "tab":
+		current.setInput(current.suggest.selected().Text)
+	case "enter":
+		text := current.suggest.selected().Text
+		current.setInput("")
+		return current.submit(text), true
+	case "esc":
+		current.suggest.dismissed = true
+	default:
+		return nil, false
+	}
+	return nil, true
+}
+
+func (current *model) setInput(text string) {
+	current.input.SetValue(text)
+	current.input.CursorEnd()
+	current.resizeInput()
+	current.syncSuggestions()
 }
 
 func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 	if message.String() != "ctrl+c" {
 		current.quitArmed = time.Time{}
+	}
+	if current.suggest.visible() {
+		if command, handled := current.handleSuggestKey(message); handled {
+			return command, true
+		}
 	}
 	switch message.String() {
 	case "enter":
@@ -176,8 +225,7 @@ func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 		if strings.TrimSpace(text) == "" {
 			return nil, true
 		}
-		current.input.Reset()
-		current.resizeInput()
+		current.setInput("")
 		return current.submit(text), true
 
 	case "esc":
@@ -189,8 +237,7 @@ func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 	case "ctrl+c":
 		switch {
 		case current.input.Value() != "":
-			current.input.Reset()
-			current.resizeInput()
+			current.setInput("")
 		case current.busy():
 			current.interrupt()
 		case !current.quitArmed.IsZero() && time.Since(current.quitArmed) < quitArmDuration:
@@ -209,6 +256,19 @@ func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 	case "ctrl+o":
 		return current.openPager(), true
 
+	case "ctrl+l":
+		current.openModelPicker("")
+		return nil, true
+
+	case "ctrl+p":
+		return current.cycleModel(1), true
+
+	case "alt+p":
+		return current.cycleModel(-1), true
+
+	case "shift+tab":
+		return current.cycleThinking(), true
+
 	case "ctrl+t":
 		current.showThinking = !current.showThinking
 		if current.showThinking {
@@ -224,8 +284,7 @@ func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 				current.draft = current.input.Value()
 			}
 			current.sentCursor = max(0, current.sentCursor-1)
-			current.input.SetValue(current.sent[current.sentCursor])
-			current.resizeInput()
+			current.setInput(current.sent[current.sentCursor])
 			return nil, true
 		}
 
@@ -233,11 +292,10 @@ func (current *model) handleKey(message tea.KeyMsg) (tea.Cmd, bool) {
 		if !strings.Contains(current.input.Value(), "\n") && current.sentCursor < len(current.sent) {
 			current.sentCursor++
 			if current.sentCursor == len(current.sent) {
-				current.input.SetValue(current.draft)
+				current.setInput(current.draft)
 			} else {
-				current.input.SetValue(current.sent[current.sentCursor])
+				current.setInput(current.sent[current.sentCursor])
 			}
-			current.resizeInput()
 			return nil, true
 		}
 	}
@@ -337,19 +395,101 @@ func (current *model) flush() tea.Cmd {
 	return tea.Sequence(tea.Println(text), func() tea.Msg { return printedMsg{} })
 }
 
-func (current *model) printBanner() tea.Cmd {
-	title := lipgloss.NewStyle().Foreground(accentColor).Bold(true).Render("unreal") +
-		dimStyle.Render(" · agent TUI on Unreal Agent Harness")
-	lines := []string{
-		title,
-		dimStyle.Render(fmt.Sprintf("%s · %s/%s · thinking %s",
-			shortenHome(current.app.Workspace), current.app.Settings.Provider, current.app.Settings.Model, current.app.Settings.Thinking)),
-		dimStyle.Render("enter send · ctrl+j newline · esc interrupt · ctrl+o transcript · /help"),
+// printStartup lists the loaded context files and skills the way pi does
+// (hidden by quietStartup), plus any configuration problems. Everything else
+// pi shows lives in the footer under the editor.
+func (current *model) printStartup() tea.Cmd {
+	app := current.app
+	var sections []string
+	if !app.Config.Settings.QuietStartup {
+		sections = current.loadedResources()
 	}
-	command := current.printRaw(strings.Join(lines, "\n"))
-	if len(current.app.Notices) != 0 {
-		command = tea.Batch(command, current.print(current.app.Notices...))
-		current.app.Notices = nil
+	var command tea.Cmd
+	if len(sections) != 0 {
+		command = current.printRaw(strings.Join(sections, "\n\n"))
+	}
+	notices := append(app.Notices, current.configProblems()...)
+	app.Notices = nil
+	if len(notices) != 0 {
+		command = tea.Batch(command, current.print(notices...))
+	}
+	return command
+}
+
+// loadedResources renders pi's [Context] and [Skills] sections.
+func (current *model) loadedResources() []string {
+	heading := lipgloss.NewStyle().Foreground(accentColor).Bold(true)
+	var sections []string
+	if files := current.app.LoadedFiles; len(files) != 0 {
+		names := make([]string, 0, len(files))
+		for _, path := range files {
+			names = append(names, shortenHome(path))
+		}
+		sections = append(sections, heading.Render("[Context]")+"\n"+dimStyle.Render(current.wrapList(names)))
+	}
+	if skills := current.app.Skills; len(skills) != 0 {
+		sections = append(sections, heading.Render("[Skills]")+"\n"+dimStyle.Render(current.wrapList(skills)))
+	}
+	return sections
+}
+
+func (current *model) wrapList(items []string) string {
+	return lipgloss.NewStyle().Width(max(20, current.width-2)).PaddingLeft(2).Render(strings.Join(items, ", "))
+}
+
+func (current *model) configProblems() []Block {
+	var blocks []Block
+	for _, warning := range current.app.Config.Warnings {
+		blocks = append(blocks, Block{Kind: BlockError, Text: "Settings: " + warning})
+	}
+	for _, warning := range current.app.Catalog.Warnings {
+		blocks = append(blocks, Block{Kind: BlockError, Text: "Models: " + warning})
+	}
+	return blocks
+}
+
+// reload re-reads settings, models.json, the system prompt files and skills,
+// and applies them without restarting the session.
+func (current *model) reload() tea.Cmd {
+	app := current.app
+	config, err := loadConfig(app.Config.Home, app.Config.Workspace)
+	if err != nil {
+		return current.print(Block{Kind: BlockError, Text: "Reload: " + err.Error()})
+	}
+	app.Config = config
+	app.Catalog = loadCatalog(config.Home)
+	app.retireClients()
+	app.Scoped = config.Settings.EnabledModels
+
+	var blocks []Block
+	info := app.Catalog.Lookup(app.Model.Provider, app.Model.ID)
+	if client, err := app.client(info.Provider); err != nil {
+		blocks = append(blocks, Block{Kind: BlockError, Text: fmt.Sprintf("Keeping the old %s client: %v", info.Provider, err)})
+	} else {
+		current.engine.SetModel(client, info.ID)
+		app.Model = info
+	}
+	if clamped := app.Model.ClampLevel(app.Thinking); clamped != app.Thinking {
+		if err := current.engine.SetEffort(llm.ReasoningEffort(clamped)); err == nil {
+			app.Thinking = clamped
+		}
+	}
+
+	prompt, files := systemPrompt(app.Prompt)
+	current.engine.SetSystemPrompt(prompt)
+	app.LoadedFiles = files
+	skills, skillErrors := discoverSkills(config.Workspace, config.Home)
+	current.engine.SetSkills(skills)
+	app.Skills = skillNames(skills)
+	for _, skillErr := range skillErrors {
+		blocks = append(blocks, Block{Kind: BlockError, Text: "Skill: " + skillErr.Error()})
+	}
+	blocks = append(blocks, current.configProblems()...)
+	current.applyDisplaySettings()
+	blocks = append(blocks, Block{Kind: BlockInfo, Text: fmt.Sprintf("Reloaded settings, %d models, the system prompt and skills", len(app.Catalog.Models))})
+	command := current.print(blocks...)
+	if sections := current.loadedResources(); len(sections) != 0 {
+		command = tea.Sequence(command, current.printRaw(strings.Join(sections, "\n\n")))
 	}
 	return command
 }
@@ -429,28 +569,80 @@ func (current *model) View() string {
 		sections = append(sections, dimStyle.Render(current.notice))
 	}
 
-	rule := ruleStyle.Render(strings.Repeat("─", max(1, current.width)))
-	sections = append(sections, rule, current.input.View(), rule, current.footer())
+	// The rules take the thinking level's colour, as in pi.
+	style := ruleStyle
+	if color, ok := thinkingColors[current.app.Thinking]; ok {
+		style = lipgloss.NewStyle().Foreground(color)
+	}
+	rule := style.Render(strings.Repeat("─", max(1, current.width)))
+	editor := current.input.View()
+	if current.overlay != nil {
+		editor = current.overlay.selector.View(current.width)
+	}
+	sections = append(sections, rule, editor, rule)
+	if current.overlay == nil && current.suggest.visible() {
+		sections = append(sections, current.suggest.view(current.width))
+	}
+	sections = append(sections, current.footer())
 	if len(sections) > 3 {
 		sections[0] = "\n" + sections[0]
 	}
 	return strings.Join(sections, "\n")
 }
 
+// footer mirrors pi's: the directory, git branch and session on the first
+// line; token usage and context fill on the left of the second, with the
+// model and thinking level on the right.
 func (current *model) footer() string {
-	settings := current.app.Settings
-	left := fmt.Sprintf("%s · %s · %s/%s · thinking %s", shortenHome(current.app.Workspace), current.sessionLabel(), settings.Provider, settings.Model, settings.Thinking)
+	width := max(1, current.width)
+	location := shortenHome(current.app.Config.Workspace)
+	if current.branch != "" {
+		location += " (" + current.branch + ")"
+	}
+	location += " • " + current.sessionLabel()
+	if lipgloss.Width(location) > width {
+		location = truncateWidth(location, max(1, width-3)) + "..."
+	}
+
 	usage := current.transcript.Usage
-	right := ""
+	var stats []string
 	if usage.Input != 0 {
-		right = fmt.Sprintf("ctx %s · ↑%s ↓%s", formatTokens(usage.Context), formatTokens(usage.Input), formatTokens(usage.Output))
+		stats = append(stats, "↑"+formatTokens(usage.Input))
 	}
-	gap := current.width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 2 {
-		left = truncateWidth(left, max(10, current.width-lipgloss.Width(right)-3)) + "…"
-		gap = max(1, current.width-lipgloss.Width(left)-lipgloss.Width(right))
+	if usage.Output != 0 {
+		stats = append(stats, "↓"+formatTokens(usage.Output))
 	}
-	return dimStyle.Render(left + strings.Repeat(" ", gap) + right)
+	if usage.Cached != 0 {
+		stats = append(stats, "R"+formatTokens(usage.Cached))
+	}
+	parts := make([]string, 0, len(stats)+1)
+	for _, stat := range stats {
+		parts = append(parts, dimStyle.Render(stat))
+	}
+	if window := current.app.Model.ContextWindow; window > 0 {
+		percent := float64(usage.Context) / float64(window) * 100
+		style := dimStyle
+		switch {
+		case percent > 90:
+			style = errorStyle
+		case percent > 70:
+			style = lipgloss.NewStyle().Foreground(warnColor)
+		}
+		parts = append(parts, style.Render(fmt.Sprintf("%.1f%%/%s", percent, formatTokens(window))))
+	} else if usage.Context != 0 {
+		parts = append(parts, dimStyle.Render("ctx "+formatTokens(usage.Context)))
+	}
+	left := strings.Join(parts, dimStyle.Render(" "))
+
+	right := current.app.Model.Key() + " • " + current.app.Thinking
+	if room := width - lipgloss.Width(left) - 2; lipgloss.Width(right) > room {
+		right = current.app.Model.ID + " • " + current.app.Thinking
+		if lipgloss.Width(right) > room {
+			right = truncateWidth(right, max(0, room))
+		}
+	}
+	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
+	return dimStyle.Render(location) + "\n" + left + dimStyle.Render(strings.Repeat(" ", gap)+right)
 }
 
 func (current *model) sessionLabel() string {
@@ -458,5 +650,44 @@ func (current *model) sessionLabel() string {
 	if id == "" {
 		return "new session"
 	}
-	return "session " + id[:min(8, len(id))]
+	return id[:min(8, len(id))]
+}
+
+// gitBranch reads the branch of the repository containing directory from
+// .git/HEAD (following worktree .git files), like pi's footer. A detached
+// HEAD shows as "detached".
+func gitBranch(directory string) string {
+	for {
+		gitPath := filepath.Join(directory, ".git")
+		if info, err := os.Stat(gitPath); err == nil {
+			gitDirectory := gitPath
+			if !info.IsDir() {
+				contents, err := os.ReadFile(gitPath)
+				if err != nil {
+					return ""
+				}
+				target, ok := strings.CutPrefix(strings.TrimSpace(string(contents)), "gitdir: ")
+				if !ok {
+					return ""
+				}
+				if !filepath.IsAbs(target) {
+					target = filepath.Join(directory, target)
+				}
+				gitDirectory = target
+			}
+			head, err := os.ReadFile(filepath.Join(gitDirectory, "HEAD"))
+			if err != nil {
+				return ""
+			}
+			if branch, ok := strings.CutPrefix(strings.TrimSpace(string(head)), "ref: refs/heads/"); ok {
+				return branch
+			}
+			return "detached"
+		}
+		parent := filepath.Dir(directory)
+		if parent == directory {
+			return ""
+		}
+		directory = parent
+	}
 }

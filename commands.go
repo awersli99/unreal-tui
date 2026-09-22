@@ -6,24 +6,30 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/unreallabsai/unreal-agent/harness/llm"
 	"github.com/unreallabsai/unreal-agent/harness/session"
 )
 
-const helpText = `Commands
-  /new                      start a new session
-  /resume [n|id]            list recent sessions, or resume one
-  /model [id]               show or switch the model
-  /provider [name] [model]  show or switch the provider (` + "%s" + `)
-  /thinking [level]         show or set reasoning effort (low, medium, high, xhigh, max)
-  /session                  show session details
-  /quit                     exit (also ctrl+d, or ctrl+c twice)
+const keysHelp = `Keys
+  enter send · ctrl+j / alt+enter newline · ↑/↓ message history · / commands
+  esc interrupt · ctrl+c clear input / interrupt · ctrl+o full transcript
+  ctrl+l model picker · ctrl+p / alt+p next / previous model · shift+tab cycle thinking
+  ctrl+t toggle thinking blocks
+  In pickers: type to filter · ↑/↓ move · enter select · esc cancel
 
-Keys
-  enter send · ctrl+j / alt+enter newline · ↑/↓ message history
-  esc interrupt · ctrl+c clear input / interrupt · ctrl+o full transcript · ctrl+t toggle thinking
-
+Model and thinking changes are remembered as the defaults for the next start.
+Settings are saved to %s.
 Messages sent while the agent works are delivered right away and steer it.`
+
+func helpText(settingsPath string) string {
+	var help strings.Builder
+	help.WriteString("Commands\n")
+	for _, command := range commands {
+		usage := strings.TrimSpace("/" + command.Name + " " + command.Args)
+		fmt.Fprintf(&help, "  %-24s %s\n", usage, command.Summary)
+	}
+	help.WriteString("\n" + fmt.Sprintf(keysHelp, settingsPath))
+	return help.String()
+}
 
 func (current *model) runCommand(text string) tea.Cmd {
 	fields := strings.Fields(text)
@@ -37,7 +43,7 @@ func (current *model) runCommand(text string) tea.Cmd {
 
 	switch name {
 	case "/help", "/?":
-		return current.printRaw(dimStyle.Render(fmt.Sprintf(helpText, strings.Join(providerNames(), ", "))))
+		return current.printRaw(dimStyle.Render(helpText(shortenHome(globalSettingsPath(current.app.Config.Home)))))
 
 	case "/quit", "/exit", "/q":
 		return tea.Quit
@@ -51,7 +57,10 @@ func (current *model) runCommand(text string) tea.Cmd {
 		return info("New session")
 
 	case "/resume", "/sessions":
-		return current.resume(args)
+		if len(args) == 0 {
+			return current.openResumePicker()
+		}
+		return current.resume(args[0])
 
 	case "/session":
 		id := current.engine.SessionID()
@@ -59,81 +68,64 @@ func (current *model) runCommand(text string) tea.Cmd {
 			return info("No session yet; one is created with your first message.")
 		}
 		usage := current.transcript.Usage
-		return info("Session %s\nFile: %s\nTokens: %s in (%s cached), %s out; last context %s",
-			id, shortenHome(current.engine.SessionPath()),
+		return info("Session %s\nFile: %s\nModel: %s · thinking %s\nTokens: %s in (%s cached), %s out; last context %s",
+			id, shortenHome(current.engine.SessionPath()), current.app.Model.Key(), current.app.Thinking,
 			formatTokens(usage.Input), formatTokens(usage.Cached), formatTokens(usage.Output), formatTokens(usage.Context))
 
 	case "/thinking", "/effort":
 		if len(args) == 0 {
-			return info("Thinking: %s (options: %s)", current.app.Settings.Thinking, strings.Join(thinkingLevels, ", "))
+			current.openThinkingPicker()
+			return nil
 		}
 		level := strings.ToLower(args[0])
 		if !validThinking(level) {
 			return fail("Unknown thinking level %q; use one of %s", args[0], strings.Join(thinkingLevels, ", "))
 		}
-		if err := current.engine.SetEffort(llm.ReasoningEffort(level)); err != nil {
-			return fail("Set thinking: %v", err)
+		if clamped := current.app.Model.ClampLevel(level); clamped != level {
+			return fail("%s does not support %s thinking; it supports %s", current.app.Model.Key(), level, strings.Join(current.app.Model.SupportedLevels(), ", "))
 		}
-		current.app.Settings.Thinking = level
-		return tea.Batch(current.saveSettings(), info("Thinking set to %s", level))
+		return current.setThinking(level)
 
-	case "/model":
+	case "/model", "/models":
 		if len(args) == 0 {
-			return info("Model: %s/%s. Switch with /model <id>.", current.app.Settings.Provider, current.app.Settings.Model)
+			current.openModelPicker("")
+			return nil
 		}
-		if current.busy() {
-			return fail("The agent is working; press esc first, then switch models.")
+		pattern := strings.Join(args, " ")
+		matches, level := current.app.Catalog.Match(pattern)
+		if len(matches) == 1 {
+			return current.switchModel(matches[0], level)
 		}
-		current.engine.SetModel(nil, args[0])
-		current.app.Settings.Model = args[0]
-		return tea.Batch(current.saveSettings(), info("Model set to %s", args[0]))
+		if len(matches) == 0 {
+			// Accept model IDs the catalog does not list, as pi does.
+			if model, level, err := current.app.Catalog.Resolve(pattern, current.app.Model.Provider); err == nil {
+				return current.switchModel(model, level)
+			}
+		}
+		query, _ := splitLevel(pattern)
+		current.openModelPicker(strings.NewReplacer("*", " ", "?", " ").Replace(query))
+		return nil
 
-	case "/provider":
-		if len(args) == 0 {
-			return info("Provider: %s (available: %s)", current.app.Settings.Provider, strings.Join(providerNames(), ", "))
-		}
-		if current.busy() {
-			return fail("The agent is working; press esc first, then switch providers.")
-		}
-		provider, err := findProvider(args[0])
-		if err != nil {
-			return fail("%v", err)
-		}
-		modelID := provider.DefaultModel
-		if len(args) > 1 {
-			modelID = args[1]
-		}
-		if modelID == "" {
-			return fail("Provider %s has no default model; use /provider %s <model>", provider.Name, provider.Name)
-		}
-		client, err := newClient(provider)
-		if err != nil {
-			return fail("%v", err)
-		}
-		current.engine.SetModel(client, modelID)
-		current.app.Settings.Provider, current.app.Settings.Model = provider.Name, modelID
-		return tea.Batch(current.saveSettings(), info("Now using %s/%s", provider.Name, modelID))
+	case "/scoped-models", "/scoped":
+		current.openScopedPicker()
+		return nil
+
+	case "/settings", "/config":
+		current.openSettingsPicker()
+		return nil
+
+	case "/reload":
+		return current.reload()
 	}
 	return fail("Unknown command %s; try /help", name)
 }
 
-func (current *model) resume(args []string) tea.Cmd {
+func (current *model) resume(selector string) tea.Cmd {
 	sessions, err := current.engine.Sessions()
 	if err != nil {
 		return current.print(Block{Kind: BlockError, Text: err.Error()})
 	}
-	if len(args) == 0 {
-		if len(sessions) == 0 {
-			return current.print(Block{Kind: BlockInfo, Text: "No sessions yet in this workspace."})
-		}
-		var list strings.Builder
-		list.WriteString("Recent sessions (resume with /resume <n>):")
-		for index, summary := range sessions[:min(15, len(sessions))] {
-			fmt.Fprintf(&list, "\n  %2d. %-9s %s", index+1, formatAgo(summary.UpdatedAt), firstLine(summary.Title, max(20, current.width-20)))
-		}
-		return current.printRaw(dimStyle.Render(list.String()))
-	}
-	target, err := pickSession(sessions, args[0])
+	target, err := pickSession(sessions, selector)
 	if err != nil {
 		return current.print(Block{Kind: BlockError, Text: err.Error()})
 	}
@@ -184,11 +176,4 @@ func pickSession(sessions []SessionSummary, selector string) (session.ID, error)
 func (current *model) resetTranscript() {
 	current.transcript = NewTranscript(current.engine.ResultTranslator)
 	current.awaiting = false
-}
-
-func (current *model) saveSettings() tea.Cmd {
-	if err := saveSettings(current.app.Home, current.app.Settings); err != nil {
-		return current.print(Block{Kind: BlockError, Text: "Save settings: " + err.Error()})
-	}
-	return nil
 }

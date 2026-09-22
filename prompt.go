@@ -10,7 +10,7 @@ import (
 )
 
 // contextFileNames are checked in order in each directory; the first match wins.
-var contextFileNames = []string{"AGENTS.md", "CLAUDE.md"}
+var contextFileNames = []string{"AGENTS.override.md", "AGENTS.md", "CLAUDE.md"}
 
 const basePrompt = `You are a coding agent working with the user in an interactive terminal session on their own machine. This is not a sandbox: Bash commands run directly on the user's computer with their permissions.
 
@@ -26,19 +26,53 @@ const basePrompt = `You are a coding agent working with the user in an interacti
 - Do not run destructive or hard-to-reverse commands (rm -rf, git reset --hard, git push --force, dropping data) or anything that affects systems beyond this machine unless the user explicitly asked for it.
 - Do not commit or push unless asked.`
 
-func systemPrompt(workspace string) string {
-	var prompt strings.Builder
-	prompt.WriteString(basePrompt)
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
+// PromptOptions control how the system prompt is assembled.
+type PromptOptions struct {
+	Workspace    string
+	Home         string
+	Shell        string
+	ContextFiles bool
+}
+
+// systemPrompt assembles the system prompt the way pi does: SYSTEM.md (project
+// .unreal/SYSTEM.md, else ~/.unreal-tui/SYSTEM.md) replaces the built-in
+// prompt, APPEND_SYSTEM.md files are appended, then the environment and the
+// AGENTS.md/CLAUDE.md context files. It also returns the files it used.
+func systemPrompt(options PromptOptions) (string, []string) {
+	workspace := options.Workspace
+	var used []string
+	base := basePrompt
+	for _, path := range []string{
+		filepath.Join(workspace, projectDirName, "SYSTEM.md"),
+		filepath.Join(options.Home, "SYSTEM.md"),
+	} {
+		if contents, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(contents)) != "" {
+			base = strings.TrimSpace(string(contents))
+			used = append(used, path)
+			break
+		}
 	}
+	var prompt strings.Builder
+	prompt.WriteString(base)
+	for _, path := range []string{
+		filepath.Join(options.Home, "APPEND_SYSTEM.md"),
+		filepath.Join(workspace, projectDirName, "APPEND_SYSTEM.md"),
+	} {
+		if contents, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(contents)) != "" {
+			prompt.WriteString("\n\n" + strings.TrimSpace(string(contents)))
+			used = append(used, path)
+		}
+	}
+	shell := firstNonEmpty(options.Shell, os.Getenv("SHELL"), "/bin/sh")
 	fmt.Fprintf(&prompt, "\n\n## Environment\n- Working directory: %s\n- Platform: %s/%s\n- Shell: %s\n- Date: %s\n",
 		workspace, runtime.GOOS, runtime.GOARCH, shell, time.Now().Format("2006-01-02"))
-	for _, file := range contextFiles(workspace) {
-		fmt.Fprintf(&prompt, "\n## Project instructions from %s\n\n%s\n", file.path, strings.TrimSpace(file.contents))
+	if options.ContextFiles {
+		for _, file := range contextFiles(workspace, options.Home) {
+			fmt.Fprintf(&prompt, "\n## Project instructions from %s\n\n%s\n", file.path, strings.TrimSpace(file.contents))
+			used = append(used, file.path)
+		}
 	}
-	return prompt.String()
+	return prompt.String(), used
 }
 
 type contextFile struct {
@@ -48,8 +82,9 @@ type contextFile struct {
 
 // contextFiles collects AGENTS.md (or CLAUDE.md) from the global config
 // directory and from each directory between the home directory and the
-// workspace, outermost first so more specific instructions come last.
-func contextFiles(workspace string) []contextFile {
+// workspace, outermost first so more specific instructions come last. As in
+// pi, AGENTS.override.md takes precedence within a directory.
+func contextFiles(workspace, configHome string) []contextFile {
 	var directories []string
 	home, _ := os.UserHomeDir()
 	for directory := workspace; ; directory = filepath.Dir(directory) {
@@ -58,9 +93,7 @@ func contextFiles(workspace string) []contextFile {
 			break
 		}
 	}
-	if configHome, err := homeDirectory(); err == nil {
-		directories = append(directories, configHome)
-	}
+	directories = append(directories, configHome)
 
 	var files []contextFile
 	seen := make(map[string]bool)

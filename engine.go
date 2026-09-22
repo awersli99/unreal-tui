@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 	"uuid"
@@ -29,7 +28,7 @@ import (
 
 const (
 	interruptReason       = "Interrupted by user"
-	restartReason         = "Restarting with new settings"
+	switchReason          = "Switching session"
 	exitReason            = "Exiting"
 	toolHeartbeatInterval = 10 * time.Minute
 	historyPageSize       = 256
@@ -55,6 +54,7 @@ type EngineConfig struct {
 	Effort         llm.ReasoningEffort
 	SystemPrompt   string
 	Skills         []tool.Skill
+	Shell          string
 	Emit           func(any)
 }
 
@@ -65,19 +65,26 @@ type EngineConfig struct {
 // go straight into its inbox and steer the agent mid-turn. Interrupting submits
 // StopHard, which cancels the model call and running tools; the next message
 // starts a fresh coordinator that resumes the persisted session.
+//
+// The model, client, and system prompt are read at every model call (see
+// liveBuilder and liveAdapter), so switching them never interrupts work.
 type Engine struct {
 	ctx            context.Context
 	store          *localfile.Store
 	storeDirectory string
 	workspace      string
-	prompt         string
-	skills         []tool.Skill
+	shell          string
 	display        tool.Registry
 	events         *eventQueue
 
+	// live guards the values read at every model call.
+	live   sync.Mutex
+	client Client
+	model  string
+	prompt string
+
 	mu             sync.Mutex
-	client         Client
-	model          string
+	skills         []tool.Skill
 	effort         llm.ReasoningEffort
 	sessionID      session.ID
 	recordedEffort llm.ReasoningEffort
@@ -112,6 +119,7 @@ func NewEngine(ctx context.Context, config EngineConfig) (*Engine, error) {
 		store:          store,
 		storeDirectory: config.StoreDirectory,
 		workspace:      config.Workspace,
+		shell:          config.Shell,
 		prompt:         config.SystemPrompt,
 		skills:         config.Skills,
 		events:         newEventQueue(),
@@ -209,33 +217,42 @@ func (engine *Engine) SetEffort(effort llm.ReasoningEffort) error {
 	return nil
 }
 
-// SetModel switches the model, and the client when non-nil. The context builder
-// is owned by the running coordinator, so a running coordinator is stopped and
-// the next message starts one with the new model.
+// SetModel switches the model, and the client when non-nil. Both take effect
+// at the next model call, even mid-turn; the caller owns client lifetimes.
 func (engine *Engine) SetModel(client Client, model string) {
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
+	engine.live.Lock()
+	defer engine.live.Unlock()
 	engine.model = model
 	if client != nil {
-		previous, run := engine.client, engine.run
 		engine.client = client
-		if run == nil {
-			previous.Close()
-		} else {
-			go func() {
-				<-run.done
-				previous.Close()
-			}()
-		}
 	}
-	engine.stopLocked(restartReason)
+}
+
+// SetSystemPrompt replaces the system prompt from the next model call on.
+func (engine *Engine) SetSystemPrompt(prompt string) {
+	engine.live.Lock()
+	defer engine.live.Unlock()
+	engine.prompt = prompt
+}
+
+// SetSkills replaces the skills offered by the next coordinator.
+func (engine *Engine) SetSkills(skills []tool.Skill) {
+	engine.mu.Lock()
+	defer engine.mu.Unlock()
+	engine.skills = skills
+}
+
+func (engine *Engine) liveModel() (Client, string, string) {
+	engine.live.Lock()
+	defer engine.live.Unlock()
+	return engine.client, engine.model, engine.prompt
 }
 
 // NewSession detaches from the current session; the next message creates one.
 func (engine *Engine) NewSession() {
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
-	engine.stopLocked(restartReason)
+	engine.stopLocked(switchReason)
 	engine.queued = nil
 	engine.sessionID = ""
 	engine.recordedEffort = ""
@@ -250,7 +267,7 @@ func (engine *Engine) ResumeSession(id session.ID) ([]sessionstore.Item, error) 
 	engine.mu.Lock()
 	defer engine.mu.Unlock()
 	if id != engine.sessionID {
-		engine.stopLocked(restartReason)
+		engine.stopLocked(switchReason)
 		engine.queued = nil
 	}
 	engine.sessionID = id
@@ -288,9 +305,8 @@ func (engine *Engine) Sessions() ([]SessionSummary, error) {
 	return summaries, nil
 }
 
-// Close stops the coordinator, letting it cancel running tools, and releases
-// the client.
-func (engine *Engine) Close() error {
+// Close stops the coordinator, letting it cancel running tools.
+func (engine *Engine) Close() {
 	engine.mu.Lock()
 	engine.closed = true
 	engine.queued = nil
@@ -303,9 +319,6 @@ func (engine *Engine) Close() error {
 		case <-time.After(closeTimeout):
 		}
 	}
-	engine.mu.Lock()
-	defer engine.mu.Unlock()
-	return engine.client.Close()
 }
 
 func (engine *Engine) stopLocked(reason string) bool {
@@ -376,9 +389,8 @@ func (engine *Engine) startLocked(inputs []inbox.Input) error {
 		cancel()
 		return fmt.Errorf("open inbox: %w", err)
 	}
-	builder := contextbuilder.NewBuilder(registry.Skills()...)
-	builder.SetModel(llm.Model{ID: engine.model, ReasoningEffort: engine.effort})
-	builder.SetSystemPrompt(engine.prompt)
+	builder := &liveBuilder{Builder: contextbuilder.NewBuilder(registry.Skills()...), engine: engine}
+	builder.SetModel(llm.Model{ReasoningEffort: engine.effort})
 	for _, definition := range registry.StaticDefinitions() {
 		builder.AddTool(definition.Tool)
 	}
@@ -389,7 +401,7 @@ func (engine *Engine) startLocked(inputs []inbox.Input) error {
 		Restored:              restored,
 		Sessions:              engine.store,
 		ContextBuilder:        builder,
-		LLM:                   engine.client,
+		LLM:                   liveAdapter{engine: engine},
 		Tools:                 registry,
 		Operations:            operation.NewLocalOperationManager(runContext),
 	})
@@ -420,10 +432,7 @@ func (engine *Engine) startLocked(inputs []inbox.Input) error {
 }
 
 func (engine *Engine) newRegistry(operationDirectory string) (tool.Registry, error) {
-	shell := strings.TrimSpace(os.Getenv("SHELL"))
-	if shell == "" {
-		shell = "/bin/sh"
-	}
+	shell := firstNonEmpty(engine.shell, os.Getenv("SHELL"), "/bin/sh")
 	names := []string{tool.BashName, tool.ViewImageName}
 	if len(engine.skills) != 0 {
 		names = append(names, tool.SkillUseName)
@@ -460,14 +469,48 @@ func (engine *Engine) loadItems(id session.ID) ([]sessionstore.Item, error) {
 	}
 }
 
-// discoverSkills loads skills from the workspace (.harness/skills, as upstream
-// does) and from the user's config directory. Workspace skills win on name
-// clashes.
+// liveBuilder applies the engine's current model and system prompt each time
+// the coordinator builds a request. Build runs on the coordinator goroutine,
+// the only one that touches the inner builder.
+type liveBuilder struct {
+	contextbuilder.Builder
+	engine  *Engine
+	applied *string
+}
+
+func (builder *liveBuilder) Build() (contextbuilder.Result, error) {
+	_, model, prompt := builder.engine.liveModel()
+	if builder.applied == nil || *builder.applied != prompt {
+		builder.Builder.SetSystemPrompt(prompt)
+		builder.applied = &prompt
+	}
+	result, err := builder.Builder.Build()
+	result.Request.Model.ID = model
+	return result, err
+}
+
+// liveAdapter sends each model call through the engine's current client.
+type liveAdapter struct {
+	engine *Engine
+}
+
+func (adapter liveAdapter) Respond(ctx context.Context, request llm.Request, options llm.RequestOptions) (llm.Response, error) {
+	client, _, _ := adapter.engine.liveModel()
+	return client.Respond(ctx, request, options)
+}
+
+// discoverSkills loads skills from the workspace (.unreal/skills, and
+// .harness/skills as upstream does) and from ~/.unreal-tui/skills. Workspace
+// skills win on name clashes.
 func discoverSkills(workspace, home string) ([]tool.Skill, []error) {
 	var skills []tool.Skill
 	var problems []error
 	seen := make(map[string]bool)
-	for _, directory := range []string{filepath.Join(workspace, ".harness", "skills"), filepath.Join(home, "skills")} {
+	for _, directory := range []string{
+		filepath.Join(workspace, projectDirName, "skills"),
+		filepath.Join(workspace, ".harness", "skills"),
+		filepath.Join(home, "skills"),
+	} {
 		if _, err := os.Stat(directory); err != nil {
 			continue
 		}
@@ -483,6 +526,14 @@ func discoverSkills(workspace, home string) ([]tool.Skill, []error) {
 	}
 	slices.SortFunc(skills, func(left, right tool.Skill) int { return cmp.Compare(left.Name, right.Name) })
 	return skills, problems
+}
+
+func skillNames(skills []tool.Skill) []string {
+	names := make([]string, 0, len(skills))
+	for _, skill := range skills {
+		names = append(names, skill.Name)
+	}
+	return names
 }
 
 func settingsInput(effort llm.ReasoningEffort) (inbox.Input, error) {
