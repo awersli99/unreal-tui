@@ -1,7 +1,7 @@
 # unreal
 
 A terminal coding agent built on the [Unreal Agent Harness](https://github.com/unreallabsai/unreal-agent),
-styled after [pi](https://github.com/earendil-works/pi).
+inspired by [pi](https://github.com/earendil-works/pi).
 
 You can message the agent while it works to steer it, press `esc` to stop it,
 and resume any past session later. It works with OpenAI, ChatGPT/Codex,
