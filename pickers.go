@@ -14,6 +14,8 @@ import (
 // overlay is a picker shown in place of the editor.
 type overlay struct {
 	selector *selector
+	// prompt, when set instead of selector, is a text prompt.
+	prompt *promptInput
 	// choose handles enter and ctrl+s. For multi-select pickers only ctrl+s
 	// calls it, with a nil item.
 	choose func(item *selectorItem) tea.Cmd
@@ -41,8 +43,18 @@ var thinkingColors = map[string]lipgloss.AdaptiveColor{
 	"max":    {Light: "#C2410C", Dark: "#FF8C5A"},
 }
 
+func (active *overlay) View(width int) string {
+	if active.prompt != nil {
+		return active.prompt.View(width)
+	}
+	return active.selector.View(width)
+}
+
 func (current *model) handleOverlayKey(message tea.KeyMsg) tea.Cmd {
 	active := current.overlay
+	if active.prompt != nil {
+		return current.handlePromptKey(active.prompt, message)
+	}
 	if active.keys != nil {
 		if command, handled := active.keys(message.String()); handled {
 			return command

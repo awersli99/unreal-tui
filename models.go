@@ -89,6 +89,14 @@ func loadCatalog(home string) *Catalog {
 		catalog.Warnings = append(catalog.Warnings, err.Error())
 	}
 
+	entries, warning, err := readCredentials(home)
+	if err != nil {
+		catalog.Warnings = append(catalog.Warnings, err.Error())
+	} else if warning != "" {
+		catalog.Warnings = append(catalog.Warnings, warning)
+	}
+	stored := storedAPIKeys(entries)
+
 	configured := make(map[string][]modelConfig)
 	names := make([]string, 0, len(file.Providers))
 	for name := range file.Providers {
@@ -111,7 +119,7 @@ func loadCatalog(home string) *Catalog {
 			api := apiAliases[config.API]
 			if api == "" {
 				catalog.Warnings = append(catalog.Warnings, fmt.Sprintf(
-					"%s: provider %q has unsupported api %q; the harness supports openai-responses, openai-codex, openrouter, fireworks and ollama",
+					"%s: provider %q has unsupported api %q; supported APIs: anthropic-messages, openai-responses, openai-codex, openrouter, fireworks and ollama",
 					modelsFileName, name, config.API))
 				continue
 			}
@@ -128,12 +136,27 @@ func loadCatalog(home string) *Catalog {
 		configured[name] = config.Models
 	}
 
+	// After custom providers are added, before availability is checked.
+	for index := range catalog.Providers {
+		spec := &catalog.Providers[index]
+		spec.StoredKey = stored[spec.Name]
+		if spec.Name == "anthropic" && !spec.Custom {
+			var credential storedCredential
+			if json.Unmarshal(entries[spec.Name], &credential) == nil && credential.Type == "oauth" {
+				spec.AuthFile = authPath(home)
+			}
+		}
+	}
+
 	codexModels, codexErr := readCodexModels()
 	for _, spec := range catalog.Providers {
 		if !spec.Available() {
 			continue
 		}
 		var models []ModelInfo
+		if !spec.Custom && spec.API == apiAnthropic {
+			models = builtinAnthropicModels(spec.Name)
+		}
 		if !spec.Custom && (spec.API == apiCodex || spec.API == apiOpenAI) {
 			if codexErr == nil {
 				for _, model := range codexModels {
@@ -151,6 +174,18 @@ func loadCatalog(home string) *Catalog {
 				continue
 			}
 			model := ModelInfo{Provider: spec.Name, ID: config.ID, Name: config.Name, ContextWindow: config.ContextWindow}
+			if spec.API == apiAnthropic {
+				model = anthropicModelInfo(spec.Name, config.ID)
+				if config.Name != "" {
+					model.Name = config.Name
+				}
+				if config.ContextWindow != 0 {
+					model.ContextWindow = config.ContextWindow
+				}
+				if len(config.ThinkingLevels) != 0 {
+					model.Levels = nil
+				}
+			}
 			for _, level := range config.ThinkingLevels {
 				if validThinking(level) {
 					model.Levels = append(model.Levels, level)
@@ -265,6 +300,9 @@ func (catalog *Catalog) Lookup(provider, id string) ModelInfo {
 		if model.Provider == provider && model.ID == id {
 			return model
 		}
+	}
+	if spec, ok := catalog.Provider(provider); ok && spec.API == apiAnthropic {
+		return anthropicModelInfo(provider, id)
 	}
 	return ModelInfo{Provider: provider, ID: id}
 }

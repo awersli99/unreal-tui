@@ -19,7 +19,6 @@ import (
 )
 
 const (
-	maxInputHeight  = 10
 	quitArmDuration = 2 * time.Second
 )
 
@@ -33,6 +32,7 @@ type model struct {
 	transcript *Transcript
 	render     *renderer
 	input      textarea.Model
+	editor     editorLayout
 	spinner    spinner.Model
 	width      int
 	height     int
@@ -59,7 +59,8 @@ type model struct {
 	notice    string
 
 	// overlay, when set, is a picker shown in place of the editor.
-	overlay *overlay
+	overlay        *overlay
+	anthropicLogin *anthropicLogin
 	// suggest is the slash-command autocomplete list under the editor.
 	suggest suggestState
 	// branch is the workspace's git branch, refreshed after each event.
@@ -71,13 +72,13 @@ func newModel(app *App) *model {
 	input.Placeholder = "Message the agent… (/ for commands)"
 	input.ShowLineNumbers = false
 	input.CharLimit = 0
-	input.MaxHeight = 1000
+	input.MaxHeight = inputRowLimit
 	input.SetHeight(1)
-	input.SetPromptFunc(2, func(line int) string {
+	input.SetPromptFunc(3, func(line int) string {
 		if line == 0 {
-			return userMarkerStyle.Render("❯ ")
+			return " " + userMarkerStyle.Render("❯ ")
 		}
-		return "  "
+		return "   "
 	})
 	input.FocusedStyle.CursorLine = lipgloss.NewStyle()
 	input.FocusedStyle.Placeholder = dimStyle
@@ -92,6 +93,7 @@ func newModel(app *App) *model {
 		transcript:   NewTranscript(app.Engine.ResultTranslator),
 		render:       newRenderer(app.Style(), 80),
 		input:        input,
+		editor:       editorLayout{probe: newProbe()},
 		spinner:      spin,
 		showThinking: !app.Config.Settings.HideThinkingBlock,
 		branch:       gitBranch(app.Config.Workspace),
@@ -130,7 +132,7 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		first := current.width == 0
 		current.width, current.height = message.Width, message.Height
 		current.render.resize(message.Width)
-		current.input.SetWidth(message.Width)
+		current.editInput(func() { current.input.SetWidth(message.Width) })
 		current.pager.Width, current.pager.Height = message.Width, max(1, message.Height-1)
 		if first {
 			return current, current.start()
@@ -143,6 +145,12 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	case printedMsg:
 		current.printing = false
 		return current, current.flush()
+
+	case loginFinishedMsg:
+		return current, current.handleLoginFinished(message)
+
+	case anthropicLoginFinishedMsg:
+		return current, current.handleAnthropicLoginFinished(message)
 
 	case engineEventMsg:
 		current.branch = gitBranch(current.app.Config.Workspace)
@@ -166,8 +174,7 @@ func (current *model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	var command tea.Cmd
-	current.input, command = current.input.Update(message)
-	current.resizeInput()
+	current.editInput(func() { current.input, command = current.input.Update(message) })
 	current.syncSuggestions()
 	return current, command
 }
@@ -204,9 +211,10 @@ func (current *model) handleSuggestKey(message tea.KeyMsg) (tea.Cmd, bool) {
 }
 
 func (current *model) setInput(text string) {
-	current.input.SetValue(text)
-	current.input.CursorEnd()
-	current.resizeInput()
+	current.editInput(func() {
+		current.input.SetValue(text)
+		current.input.CursorEnd()
+	})
 	current.syncSuggestions()
 }
 
@@ -457,14 +465,22 @@ func (current *model) reload() tea.Cmd {
 		return current.print(Block{Kind: BlockError, Text: "Reload: " + err.Error()})
 	}
 	app.Config = config
-	app.Catalog = loadCatalog(config.Home)
-	app.retireClients()
 	app.Scoped = config.Settings.EnabledModels
+	return current.reloadPrompt(current.refreshProviders())
+}
+
+// refreshProviders reloads models.json and stored credentials, then rebuilds
+// the current model's client so changed keys apply to the next request.
+func (current *model) refreshProviders() []Block {
+	app := current.app
+	app.Catalog = loadCatalog(app.Config.Home)
+	app.retireClients()
 
 	var blocks []Block
 	info := app.Catalog.Lookup(app.Model.Provider, app.Model.ID)
 	if client, err := app.client(info.Provider); err != nil {
-		blocks = append(blocks, Block{Kind: BlockError, Text: fmt.Sprintf("Keeping the old %s client: %v", info.Provider, err)})
+		current.engine.SetModel(unavailableClient{err: err}, info.ID)
+		blocks = append(blocks, Block{Kind: BlockError, Text: fmt.Sprintf("%s is unavailable; use /login or /model: %v", info.Provider, err)})
 	} else {
 		current.engine.SetModel(client, info.ID)
 		app.Model = info
@@ -474,7 +490,12 @@ func (current *model) reload() tea.Cmd {
 			app.Thinking = clamped
 		}
 	}
+	return blocks
+}
 
+// reloadPrompt is the second half of /reload: prompt files and skills.
+func (current *model) reloadPrompt(blocks []Block) tea.Cmd {
+	app, config := current.app, current.app.Config
 	prompt, files := systemPrompt(app.Prompt)
 	current.engine.SetSystemPrompt(prompt)
 	app.LoadedFiles = files
@@ -492,10 +513,6 @@ func (current *model) reload() tea.Cmd {
 		command = tea.Sequence(command, current.printRaw(strings.Join(sections, "\n\n")))
 	}
 	return command
-}
-
-func (current *model) resizeInput() {
-	current.input.SetHeight(min(maxInputHeight, max(1, current.input.LineCount())))
 }
 
 func (current *model) openPager() tea.Cmd {
@@ -574,12 +591,12 @@ func (current *model) View() string {
 	if color, ok := thinkingColors[current.app.Thinking]; ok {
 		style = lipgloss.NewStyle().Foreground(color)
 	}
-	rule := style.Render(strings.Repeat("─", max(1, current.width)))
-	editor := current.input.View()
 	if current.overlay != nil {
-		editor = current.overlay.selector.View(current.width)
+		rule := style.Render(strings.Repeat("─", max(1, current.width)))
+		sections = append(sections, rule, current.overlay.View(current.width), rule)
+	} else {
+		sections = append(sections, current.inputView(func(line string) string { return style.Render(line) }))
 	}
-	sections = append(sections, rule, editor, rule)
 	if current.overlay == nil && current.suggest.visible() {
 		sections = append(sections, current.suggest.view(current.width))
 	}
@@ -594,7 +611,10 @@ func (current *model) View() string {
 // line; token usage and context fill on the left of the second, with the
 // model and thinking level on the right.
 func (current *model) footer() string {
-	width := max(1, current.width)
+	// Inset the footer from both edges of the terminal; some terminals clip
+	// the last column.
+	const leftMargin, rightMargin = 1, 1
+	width := max(1, current.width-leftMargin-rightMargin)
 	location := shortenHome(current.app.Config.Workspace)
 	if current.branch != "" {
 		location += " (" + current.branch + ")"
@@ -615,6 +635,9 @@ func (current *model) footer() string {
 	if usage.Cached != 0 {
 		stats = append(stats, "R"+formatTokens(usage.Cached))
 	}
+	if rate, ok := usage.CacheHitRate(); ok {
+		stats = append(stats, fmt.Sprintf("CH%.1f%%", rate))
+	}
 	parts := make([]string, 0, len(stats)+1)
 	for _, stat := range stats {
 		parts = append(parts, dimStyle.Render(stat))
@@ -634,15 +657,42 @@ func (current *model) footer() string {
 	}
 	left := strings.Join(parts, dimStyle.Render(" "))
 
-	right := current.app.Model.Key() + " • " + current.app.Thinking
-	if room := width - lipgloss.Width(left) - 2; lipgloss.Width(right) > room {
-		right = current.app.Model.ID + " • " + current.app.Thinking
-		if lipgloss.Width(right) > room {
-			right = truncateWidth(right, max(0, room))
+	right := footerModel(current.app.Model.Provider, current.app.Model.ID, current.app.Thinking, width-lipgloss.Width(left)-2)
+	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
+	indent := strings.Repeat(" ", leftMargin)
+	return indent + dimStyle.Render(location) + "\n" + indent + left + dimStyle.Render(strings.Repeat(" ", gap)+right)
+}
+
+// footerModel formats the right side of the footer's second line within room
+// columns. The model ID and thinking level are kept whole where possible: the
+// provider prefix is shortened with an ellipsis and then dropped first. Only
+// when "model • level" alone does not fit is the model ID shortened, and the
+// thinking level is cut last.
+func footerModel(provider, id, thinking string, room int) string {
+	room = max(0, room)
+	suffix := ""
+	if thinking != "" {
+		suffix = " • " + thinking
+	}
+	tail := id + suffix
+	if provider != "" {
+		if full := provider + "/" + tail; lipgloss.Width(full) <= room {
+			return full
+		}
+		if available := room - lipgloss.Width(tail) - 2; available > 0 {
+			return truncateWidth(provider, available) + "…/" + tail
 		}
 	}
-	gap := max(1, width-lipgloss.Width(left)-lipgloss.Width(right))
-	return dimStyle.Render(location) + "\n" + left + dimStyle.Render(strings.Repeat(" ", gap)+right)
+	if lipgloss.Width(tail) <= room {
+		return tail
+	}
+	if available := room - lipgloss.Width(suffix) - 1; available >= 4 {
+		return truncateWidth(id, available) + "…" + suffix
+	}
+	if thinking != "" && lipgloss.Width(thinking) <= room {
+		return thinking
+	}
+	return truncateWidth(firstNonEmpty(thinking, id), room)
 }
 
 func (current *model) sessionLabel() string {

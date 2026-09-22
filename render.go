@@ -8,12 +8,19 @@ import (
 	"time"
 
 	"github.com/charmbracelet/glamour"
+	"github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/lipgloss"
 )
 
 const (
 	toolPreviewHead = 8
 	toolPreviewTail = 4
+	// markdownMargin is the left margin of glamour's dark and light styles,
+	// which assistant text is rendered with.
+	markdownMargin = 2
+	// hiddenThinkingLabel stands in for reasoning while it is hidden, as in pi.
+	hiddenThinkingLabel = "Thinking..."
 )
 
 var (
@@ -35,6 +42,8 @@ var (
 type renderer struct {
 	width    int
 	markdown *glamour.TermRenderer
+	// thinking renders reasoning like assistant text, in dim italics.
+	thinking *glamour.TermRenderer
 	style    string
 }
 
@@ -68,6 +77,28 @@ func (current *renderer) resize(width int) {
 	if err == nil {
 		current.markdown = markdown
 	}
+	thinking, err := glamour.NewTermRenderer(
+		glamour.WithStyles(thinkingStyles(current.style)),
+		glamour.WithWordWrap(max(20, width-4)),
+		glamour.WithEmoji(),
+	)
+	if err == nil {
+		current.thinking = thinking
+	}
+}
+
+// thinkingStyles is the markdown style with dim italic body text, like pi's
+// thinking blocks. Markdown elements keep their own styling.
+func thinkingStyles(style string) ansi.StyleConfig {
+	config := styles.DarkStyleConfig
+	color := dimColor.Dark
+	if style == styles.LightStyle {
+		config, color = styles.LightStyleConfig, dimColor.Light
+	}
+	italic := true
+	config.Document.Color = &color
+	config.Document.Italic = &italic
+	return config
 }
 
 // block renders a finished block. full disables tool output truncation.
@@ -79,10 +110,11 @@ func (current *renderer) block(block Block, showThinking, full bool) string {
 	case BlockAssistant:
 		return current.renderMarkdown(block.Text)
 	case BlockReasoning:
+		// Rendered like assistant text, as pi does.
 		if !showThinking {
-			return ""
+			return strings.Repeat(" ", markdownMargin) + thinkingStyle.Render(hiddenThinkingLabel)
 		}
-		return thinkingStyle.Render(wrap.Render("∴ " + block.Text))
+		return current.renderWith(current.thinking, block.Text)
 	case BlockTool:
 		return current.tool(block.Tool, full)
 	case BlockInfo:
@@ -94,10 +126,14 @@ func (current *renderer) block(block Block, showThinking, full bool) string {
 }
 
 func (current *renderer) renderMarkdown(text string) string {
-	if current.markdown == nil {
+	return current.renderWith(current.markdown, text)
+}
+
+func (current *renderer) renderWith(markdown *glamour.TermRenderer, text string) string {
+	if markdown == nil {
 		return text
 	}
-	rendered, err := current.markdown.Render(text)
+	rendered, err := markdown.Render(text)
 	if err != nil {
 		return text
 	}

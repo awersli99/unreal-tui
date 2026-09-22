@@ -46,7 +46,7 @@ func parseFlags(arguments []string) (options, []string, error) {
 Interactive coding agent on the Unreal Agent Harness. Flags go before the prompt.
 
 Options:
-  --provider <name>       provider (openai-codex, openai, openrouter, fireworks, ollama, or one from models.json)
+  --provider <name>       provider (openai-codex, openai, anthropic, openrouter, fireworks, ollama, or one from models.json)
   --model <pattern>       model: provider/id, id, or a pattern; ":<level>" sets thinking, e.g. gpt-6-astra:max
   --thinking <level>      thinking level: low, medium, high, xhigh, max
   --models <patterns>     comma-separated models for ctrl+p cycling this session, e.g. "gpt-6*,openrouter/*"
@@ -142,7 +142,8 @@ func run() error {
 		config.Settings.ModelThinkingLevels[info.Key()], config.Settings.DefaultThinkingLevel, info.DefaultLevel, defaultThinking))
 	client, err := app.client(info.Provider)
 	if err != nil {
-		return err
+		client = unavailableClient{err: err}
+		app.Notices = append(app.Notices, Block{Kind: BlockInfo, Text: "Use /login to configure a provider. " + err.Error()})
 	}
 	defer app.Close()
 
@@ -248,6 +249,11 @@ func startupModel(catalog *Catalog, settings Settings, flagValues options) (Mode
 	}
 	detected, err := detectProvider(catalog)
 	if err != nil {
+		// A fresh install must be able to reach /login without an API key or
+		// an external CLI already configured. No request is sent until login.
+		if _, ok := catalog.Provider("anthropic"); ok && len(catalog.Models) == 0 {
+			return providerDefault(catalog, "anthropic")
+		}
 		return ModelInfo{}, "", err
 	}
 	return providerDefault(catalog, detected)
@@ -277,7 +283,7 @@ func listModels(catalog *Catalog, search string) error {
 		}
 	}
 	if len(models) == 0 {
-		fmt.Println("No models found. Log in with `codex login`, set an API key, or configure models.json.")
+		fmt.Println("No models found. Start unreal and use /login, set an API key, or configure models.json.")
 		return nil
 	}
 	writer := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)

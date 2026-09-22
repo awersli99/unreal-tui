@@ -24,6 +24,8 @@ var commands = []commandSpec{
 	{Name: "scoped-models", Summary: "Choose the models ctrl+p cycles through", Aliases: []string{"scoped"}},
 	{Name: "settings", Summary: "Change settings", Aliases: []string{"config"}},
 	{Name: "reload", Summary: "Reload settings, models.json, SYSTEM.md, AGENTS.md and skills"},
+	{Name: "login", Args: "[provider]", Summary: "Sign in with an account or save an API key"},
+	{Name: "logout", Args: "[provider]", Summary: "Remove stored credentials"},
 	{Name: "new", Summary: "Start a new session", Aliases: []string{"clear"}},
 	{Name: "resume", Args: "[n|id]", Summary: "Resume a previous session", Aliases: []string{"sessions"}},
 	{Name: "session", Summary: "Show session details"},
@@ -67,6 +69,25 @@ func (app *App) suggestionsFor(input string) []suggestion {
 		for _, model := range app.Catalog.Models {
 			if fuzzyMatch(model.Key()+" "+model.Name, argument) {
 				suggestions = append(suggestions, suggestion{Label: model.Key(), Detail: model.Name, Text: "/model " + model.Key()})
+			}
+		}
+	case "login", "logout":
+		var providers []string
+		if command.Name == "logout" {
+			providers, _ = storedProviders(app.Config.Home)
+			if codexAuthExists() && !slices.Contains(providers, "openai-codex") {
+				providers = append(providers, "openai-codex")
+			}
+		} else {
+			for _, spec := range app.Catalog.Providers {
+				if spec.needsKey() || spec.API == apiCodex {
+					providers = append(providers, spec.Name)
+				}
+			}
+		}
+		for _, provider := range providers {
+			if strings.HasPrefix(provider, strings.ToLower(argument)) {
+				suggestions = append(suggestions, suggestion{Label: provider, Text: "/" + command.Name + " " + provider})
 			}
 		}
 	case "thinking":

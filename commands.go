@@ -116,6 +116,12 @@ func (current *model) runCommand(text string) tea.Cmd {
 
 	case "/reload":
 		return current.reload()
+
+	case "/login":
+		return current.openLogin(strings.Join(args, " "))
+
+	case "/logout":
+		return current.openLogout(strings.Join(args, " "))
 	}
 	return fail("Unknown command %s; try /help", name)
 }

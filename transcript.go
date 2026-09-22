@@ -51,9 +51,22 @@ type ToolView struct {
 }
 
 type Usage struct {
-	Input, Cached, Output int64
+	// Input includes both cache reads (Cached) and cache writes (CacheWrite).
+	Input, Cached, CacheWrite, Output int64
 	// Context is the input size of the latest model call.
 	Context int64
+	// LastInput and LastCached are the prompt and cache-read tokens of the
+	// latest model call, for the cache hit rate.
+	LastInput, LastCached int64
+}
+
+// CacheHitRate is the percentage of the latest call's prompt served from the
+// cache, as pi's footer shows it. It is unknown until caching has been seen.
+func (usage Usage) CacheHitRate() (float64, bool) {
+	if (usage.Cached == 0 && usage.CacheWrite == 0) || usage.LastInput <= 0 {
+		return 0, false
+	}
+	return float64(usage.LastCached) / float64(usage.LastInput) * 100, true
 }
 
 type callKey struct {
@@ -159,8 +172,11 @@ func (transcript *Transcript) applyResponse(response sessionstore.ModelResponse,
 	usage := response.Response.Usage
 	transcript.Usage.Input += usage.InputTokens
 	transcript.Usage.Cached += usage.CachedInputTokens
+	transcript.Usage.CacheWrite += usage.CacheWriteInputTokens
 	transcript.Usage.Output += usage.OutputTokens
 	transcript.Usage.Context = usage.InputTokens + usage.OutputTokens
+	transcript.Usage.LastInput = usage.InputTokens
+	transcript.Usage.LastCached = usage.CachedInputTokens
 
 	var blocks []Block
 	for _, output := range response.Response.Output {

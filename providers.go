@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -15,9 +16,10 @@ import (
 	"github.com/unreallabsai/unreal-agent/harness/llm/clients/openrouter"
 )
 
-// API kinds are the harness's client implementations. models.json may use
-// these names or pi's equivalent ("openai-responses").
+// API kinds select a harness client or the local Anthropic adapter.
+// models.json may use these names or their pi equivalents.
 const (
+	apiAnthropic  = "anthropic-messages"
 	apiOpenAI     = "openai-responses"
 	apiCodex      = "openai-codex"
 	apiOpenRouter = "openrouter"
@@ -33,13 +35,15 @@ const (
 )
 
 var apiAliases = map[string]string{
-	"openai":           apiOpenAI,
-	"openai-responses": apiOpenAI,
-	"openai-codex":     apiCodex,
-	"codex":            apiCodex,
-	"openrouter":       apiOpenRouter,
-	"fireworks":        apiFireworks,
-	"ollama":           apiOllama,
+	"anthropic":          apiAnthropic,
+	"anthropic-messages": apiAnthropic,
+	"openai":             apiOpenAI,
+	"openai-responses":   apiOpenAI,
+	"openai-codex":       apiCodex,
+	"codex":              apiCodex,
+	"openrouter":         apiOpenRouter,
+	"fireworks":          apiFireworks,
+	"ollama":             apiOllama,
 }
 
 // Client is an LLM adapter that owns network resources.
@@ -56,6 +60,8 @@ type ProviderSpec struct {
 	BaseURL      string
 	APIKey       string // Unresolved models.json value.
 	APIKeyEnv    string // Built-in environment variable.
+	StoredKey    string // Saved by /login in auth.json; used literally.
+	AuthFile     string // Local Anthropic OAuth credentials, read/refreshed per request.
 	DefaultModel string
 	Custom       bool
 }
@@ -64,6 +70,7 @@ func builtinProviders() []ProviderSpec {
 	specs := []ProviderSpec{
 		{Name: "openai-codex", API: apiCodex, BaseURL: openaicodex.BaseURL, DefaultModel: defaultOpenAIModel},
 		{Name: "openai", API: apiOpenAI, BaseURL: "https://api.openai.com/v1", APIKeyEnv: "OPENAI_API_KEY", DefaultModel: defaultOpenAIModel},
+		{Name: "anthropic", API: apiAnthropic, BaseURL: anthropicBaseURL, APIKeyEnv: "ANTHROPIC_API_KEY", DefaultModel: defaultAnthropicModel},
 		{Name: "openrouter", API: apiOpenRouter, BaseURL: "https://openrouter.ai/api/v1", APIKeyEnv: "OPENROUTER_API_KEY"},
 		{Name: "fireworks", API: apiFireworks, BaseURL: "https://api.fireworks.ai/inference/v1", APIKeyEnv: "FIREWORKS_API_KEY"},
 		{Name: "ollama", API: apiOllama, BaseURL: ollama.BaseURL},
@@ -79,7 +86,7 @@ func builtinProviders() []ProviderSpec {
 
 func (spec ProviderSpec) needsKey() bool {
 	switch spec.API {
-	case apiOpenAI, apiOpenRouter, apiFireworks:
+	case apiAnthropic, apiOpenAI, apiOpenRouter, apiFireworks:
 		return true
 	}
 	return false
@@ -91,8 +98,15 @@ func (spec ProviderSpec) Available() bool {
 	switch {
 	case spec.API == apiCodex:
 		return codexAuthExists()
+	case spec.AuthFile != "":
+		_, _, err := readAnthropicCredential(spec.AuthFile)
+		return err == nil
+	case spec.StoredKey != "":
+		return true
 	case spec.APIKey != "":
 		return true
+	case spec.API == apiAnthropic:
+		return !spec.Custom && anthropicAuthAvailable()
 	case spec.APIKeyEnv != "":
 		return strings.TrimSpace(os.Getenv(providerAPIKeyOverride)) != "" || strings.TrimSpace(os.Getenv(spec.APIKeyEnv)) != ""
 	}
@@ -101,7 +115,12 @@ func (spec ProviderSpec) Available() bool {
 
 func (spec ProviderSpec) newClient(maxAttempts int) (Client, error) {
 	var apiKey string
+	// Like pi, a key saved with /login wins over the environment and models.json.
 	switch {
+	case spec.AuthFile != "":
+		// OAuth resolves from the file, never from a stale cached access token.
+	case spec.StoredKey != "":
+		apiKey = spec.StoredKey
 	case spec.APIKey != "":
 		resolved, err := resolveConfigValue(spec.APIKey)
 		if err != nil {
@@ -111,7 +130,10 @@ func (spec ProviderSpec) newClient(maxAttempts int) (Client, error) {
 	case spec.APIKeyEnv != "":
 		apiKey = firstNonEmpty(os.Getenv(providerAPIKeyOverride), os.Getenv(spec.APIKeyEnv))
 	}
-	if spec.needsKey() && strings.TrimSpace(apiKey) == "" {
+	if spec.API == apiAnthropic && spec.APIKey != "" && spec.StoredKey == "" && spec.AuthFile == "" && strings.TrimSpace(apiKey) == "" {
+		return nil, fmt.Errorf("provider %s apiKey resolved to an empty value", spec.Name)
+	}
+	if spec.needsKey() && spec.API != apiAnthropic && strings.TrimSpace(apiKey) == "" {
 		if spec.APIKeyEnv != "" {
 			return nil, fmt.Errorf("%s must be set to use provider %s", spec.APIKeyEnv, spec.Name)
 		}
@@ -121,6 +143,8 @@ func (spec ProviderSpec) newClient(maxAttempts int) (Client, error) {
 	var client Client
 	var err error
 	switch spec.API {
+	case apiAnthropic:
+		client, err = newAnthropicClient(spec, apiKey, maxAttempts)
 	case apiOpenAI:
 		client, err = openai.NewClient(openai.Config{APIKey: apiKey, BaseURL: spec.BaseURL, MaxAttempts: &maxAttempts})
 	case apiCodex:
@@ -180,7 +204,7 @@ func detectProvider(catalog *Catalog) (string, error) {
 	if len(catalog.Models) != 0 {
 		return catalog.Models[0].Provider, nil
 	}
-	return "", errors.New("no LLM credentials found: set OPENAI_API_KEY, log in with `codex login`, or configure a provider in ~/.unreal-tui/models.json")
+	return "", errors.New("no LLM credentials found: set OPENAI_API_KEY or ANTHROPIC_API_KEY, use /login in unreal, or configure a provider in ~/.unreal-tui/models.json")
 }
 
 func firstNonEmpty(values ...string) string {
@@ -191,3 +215,12 @@ func firstNonEmpty(values ...string) string {
 	}
 	return ""
 }
+
+// Keep configuration commands accessible before login and after logout. Never
+// keep using an old authenticated client when its credentials were removed.
+type unavailableClient struct{ err error }
+
+func (client unavailableClient) Respond(context.Context, llm.Request, llm.RequestOptions) (llm.Response, error) {
+	return llm.Response{}, fmt.Errorf("provider unavailable; use /login or /model: %w", client.err)
+}
+func (unavailableClient) Close() error { return nil }

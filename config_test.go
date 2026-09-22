@@ -139,7 +139,8 @@ func isolateProviders(t *testing.T) string {
 	t.Helper()
 	codex := t.TempDir()
 	t.Setenv("CODEX_HOME", codex)
-	for _, name := range []string{"OPENAI_API_KEY", "OPENROUTER_API_KEY", "FIREWORKS_API_KEY", providerAPIKeyOverride,
+	t.Setenv("ANTHROPIC_AUTH_FILE", filepath.Join(t.TempDir(), "auth.json"))
+	for _, name := range []string{"ANTHROPIC_API_KEY", "ANTHROPIC_OAUTH_TOKEN", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "FIREWORKS_API_KEY", providerAPIKeyOverride,
 		baseURLEnvironment, "OPENAI_CODEX_ACCESS_TOKEN", "OPENAI_CODEX_AUTH_FILE"} {
 		t.Setenv(name, "")
 	}

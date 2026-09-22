@@ -496,6 +496,9 @@ type liveAdapter struct {
 
 func (adapter liveAdapter) Respond(ctx context.Context, request llm.Request, options llm.RequestOptions) (llm.Response, error) {
 	client, _, _ := adapter.engine.liveModel()
+	if _, anthropic := client.(*anthropicClient); !anthropic {
+		request.Input = withoutAnthropicState(request.Input)
+	}
 	return client.Respond(ctx, request, options)
 }
 
