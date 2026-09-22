@@ -93,7 +93,8 @@ The system prompt includes `AGENTS.md` (or `CLAUDE.md`; `AGENTS.override.md`
 takes precedence) from several places, in this order:
 
 1. `~/.unreal-tui`
-2. each directory from your home directory down to the workspace
+2. each directory from your home directory down to the workspace (for a
+   workspace outside your home directory, from the filesystem root)
 
 `-nc` skips them. Skills load from these directories:
 

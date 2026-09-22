@@ -12,6 +12,12 @@ Anthropic (API key or Claude subscription), OpenRouter, Fireworks and Ollama.
 It needs Go 1.27.1+ and runs on macOS or Linux.
 
 ```sh
+go install github.com/awersli99/unreal-tui/cmd/unreal@latest
+```
+
+Or build from source:
+
+```sh
 git clone https://github.com/awersli99/unreal-tui.git
 cd unreal-tui
 make install    # symlinks the binary to ~/.local/bin/unreal
@@ -78,11 +84,22 @@ environment variables, and Anthropic subscription login details.
 
 ```sh
 make test     # offline tests, no API keys needed
+make lint     # golangci-lint (pinned version, see .golangci.yml)
+make fmt      # gofmt + goimports
 make build    # outputs bin/unreal
 ```
 
-Issues and PRs are welcome. Please run `make test` before submitting. To
-report a security issue, see [SECURITY.md](SECURITY.md).
+The code is organised as:
+
+- `cmd/unreal`: flags and startup
+- `internal/tui`: the Bubble Tea interface
+- `internal/engine`: drives the harness coordinator and builds the transcript
+- `internal/provider`: providers, their clients and the model catalog
+- `internal/anthropic`: the Anthropic Messages client and Claude OAuth login
+- `internal/config`: settings, saved credentials, system prompt and skills
+
+Issues and PRs are welcome. Please run `make test` and `make lint` before
+submitting. To report a security issue, see [SECURITY.md](SECURITY.md).
 
 ## License
 
